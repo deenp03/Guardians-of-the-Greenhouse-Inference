@@ -67,7 +67,8 @@ SAM3_PROMPTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Model loading (CPU at startup; ZeroGPU moves to GPU during @spaces.GPU calls)
+# Download weights at startup (small overhead, no model loaded into RAM yet)
+# Models are instantiated lazily inside @spaces.GPU where GPU memory is available
 # ---------------------------------------------------------------------------
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 if HF_TOKEN:
@@ -78,11 +79,6 @@ if not os.path.exists(SAM3_PATH):
     print("Downloading SAM3 ...")
     hf_hub_download(repo_id="facebook/sam3", filename="sam3.pt", local_dir=MODELS_DIR)
 
-sam3_predictor = SAM3SemanticPredictor(overrides=dict(
-    conf=0.30, task="segment", mode="predict",
-    model=SAM3_PATH, half=False, verbose=False,
-))
-
 FLOWER_PATH = os.path.join(MODELS_DIR, "best.pt")
 if not os.path.exists(FLOWER_PATH):
     print("Downloading flower model ...")
@@ -90,13 +86,34 @@ if not os.path.exists(FLOWER_PATH):
         repo_id="deenp03/tomato_pollination_stage_classifier",
         filename="best.pt", local_dir=MODELS_DIR,
     )
-flower_model = YOLO(FLOWER_PATH)
 
-print("Models ready.")
+print("Weights ready. Models will load on first inference request.")
+
+# Lazy singletons — populated on first @spaces.GPU call, not at startup
+_sam3_predictor = None
+_flower_model   = None
+
+
+def _get_models():
+    """Instantiate models on first call (inside GPU context). Reuse after that."""
+    global _sam3_predictor, _flower_model
+
+    if _sam3_predictor is None:
+        print("Loading SAM3 into GPU memory ...")
+        _sam3_predictor = SAM3SemanticPredictor(overrides=dict(
+            conf=0.30, task="segment", mode="predict",
+            model=SAM3_PATH, half=True, verbose=False,
+        ))
+
+    if _flower_model is None:
+        print("Loading flower model ...")
+        _flower_model = YOLO(FLOWER_PATH)
+
+    return _sam3_predictor, _flower_model
 
 
 # ---------------------------------------------------------------------------
-# Drawing helper
+# Drawing helpers
 # ---------------------------------------------------------------------------
 def _draw_boxes(pil_img: Image.Image, boxes: list[dict]) -> Image.Image:
     img = pil_img.copy().convert("RGB")
@@ -108,8 +125,7 @@ def _draw_boxes(pil_img: Image.Image, boxes: list[dict]) -> Image.Image:
 
     for b in boxes:
         x1, y1, x2, y2 = b["x1"], b["y1"], b["x2"], b["y2"]
-        color = b["color"]
-        label = b["label"]
+        color, label = b["color"], b["label"]
         draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
         tb = draw.textbbox((x1, y1), label, font=font)
         draw.rectangle([tb[0]-2, tb[1]-2, tb[2]+2, tb[3]+2], fill=color)
@@ -125,26 +141,20 @@ def _pil_to_b64(img: Image.Image) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core inference — @spaces.GPU means ZeroGPU allocates a free GPU only here
-# Returns structured dicts so both the UI and the API can consume it.
+# Core inference — models loaded here inside the GPU context, not at startup
 # ---------------------------------------------------------------------------
 @spaces.GPU(duration=120)
 def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
-    """
-    Run SAM3 (tomatoes) + YOLOv8 (flowers).
-    Returns a dict with full detection data + combined annotated PIL image.
-    """
-    pil_img = Image.fromarray(img_np)
+    sam3, flower = _get_models()
+    pil_img    = Image.fromarray(img_np)
     draw_boxes = []
 
     # --- SAM3: Tomato Ripeness ---
     tomato_detections = []
-    tomato_by_class = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
+    tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
 
-    sam3_predictor.set_image(img_np)
-    results = sam3_predictor(text=SAM3_PROMPTS)
-
-    for result in results:
+    sam3.set_image(img_np)
+    for result in sam3(text=SAM3_PROMPTS):
         if result.boxes is None or len(result.boxes) == 0:
             continue
         for box in result.boxes:
@@ -168,29 +178,22 @@ def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -
 
     # --- YOLOv8: Flower Stages ---
     flower_detections = []
-    stage_counts = {"0": 0, "1": 0, "2": 0}
+    stage_counts      = {"0": 0, "1": 0, "2": 0}
 
-    for result in flower_model(img_np, verbose=False, conf=flower_conf):
+    for result in flower(img_np, verbose=False, conf=flower_conf):
         if result.boxes is None:
             continue
         for box in result.boxes:
             conf  = round(float(box.conf[0]), 4)
             stage = int(box.cls[0])
             x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
-            flower_detections.append({
-                "bounding_box": [x1, y1, x2, y2],
-                "stage": stage,
-                "confidence": conf,
-            })
+            flower_detections.append({"bounding_box": [x1, y1, x2, y2], "stage": stage, "confidence": conf})
             stage_counts[str(stage)] = stage_counts.get(str(stage), 0) + 1
-            stage_name = FLOWER_CLASSES.get(stage, f"stage_{stage}")
             draw_boxes.append({
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "color": FLOWER_COLORS.get(stage, (200, 200, 200)),
-                "label": f"{stage_name} {conf:.2f}",
+                "label": f"{FLOWER_CLASSES.get(stage, f'stage_{stage}')} {conf:.2f}",
             })
-
-    annotated_pil = _draw_boxes(pil_img, draw_boxes)
 
     return {
         "tomatoes": {
@@ -202,44 +205,27 @@ def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -
             "total_flowers": len(flower_detections),
             "stage_counts": stage_counts,
         },
-        "annotated_pil": annotated_pil,   # PIL image — stripped before JSON response
+        "annotated_pil": _draw_boxes(pil_img, draw_boxes),
     }
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app  (mounted alongside Gradio at /api/*)
+# FastAPI app
 # ---------------------------------------------------------------------------
 fapp = FastAPI()
 
 
 @fapp.post("/api/classify")
 async def classify(
-    file: UploadFile = File(..., description="Image file (jpg/png)"),
-    tomato_conf: float = Form(0.30, description="SAM3 confidence threshold for tomatoes"),
-    flower_conf: float = Form(0.25, description="YOLO confidence threshold for flowers"),
+    file: UploadFile = File(...),
+    tomato_conf: float = Form(0.30),
+    flower_conf: float = Form(0.25),
 ):
-    """
-    Classify tomato ripeness (SAM3) and flower stage (YOLOv8) in one call.
-
-    Send as multipart/form-data:
-        file        — the image
-        tomato_conf — float 0-1, default 0.30
-        flower_conf — float 0-1, default 0.25
-
-    Returns JSON matching the structure used internally by classifier.py,
-    with an additional annotated_image_b64 field (base64 JPEG).
-    """
     image_bytes = await file.read()
     img_np = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-
     result = _run_inference(img_np, tomato_conf, flower_conf)
-
     annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
-
-    return JSONResponse({
-        **result,
-        "annotated_image_b64": annotated_b64,
-    })
+    return JSONResponse({**result, "annotated_image_b64": annotated_b64})
 
 
 @fapp.get("/api/health")
@@ -248,22 +234,16 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI (mounted at /)
+# Gradio UI
 # ---------------------------------------------------------------------------
-def _gradio_predict(pil_img: Image.Image, tomato_conf: float, flower_conf: float):
-    """Wrapper for the Gradio interface — formats output for display."""
+def _gradio_predict(pil_img, tomato_conf, flower_conf):
     if pil_img is None:
         return None, "Upload an image first."
-
-    img_np = np.array(pil_img.convert("RGB"))
-    result = _run_inference(img_np, tomato_conf, flower_conf)
-
+    result = _run_inference(np.array(pil_img.convert("RGB")), tomato_conf, flower_conf)
     tc = result["tomatoes"]["summary"]["by_class"]
     fc = result["flowers"]["stage_counts"]
-
     summary = f"""
 ## Results
-
 ### Tomatoes — {result['tomatoes']['summary']['total']} detected
 | Stage | Count |
 |---|---|
@@ -282,11 +262,7 @@ def _gradio_predict(pil_img: Image.Image, tomato_conf: float, flower_conf: float
 
 
 with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("""
-# 🌿 Greenhouse Guardians
-**Tomato Ripeness** (SAM3) + **Flower Stage** (YOLOv8) Detection
-    """)
-
+    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (SAM3) + **Flower Stage** (YOLOv8) Detection")
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(type="pil", label="Upload Plant Image")
@@ -300,19 +276,9 @@ with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
         with gr.Column(scale=1):
             image_output = gr.Image(type="pil", label="Annotated Result")
             results_md   = gr.Markdown()
+    run_btn.click(fn=_gradio_predict,
+                  inputs=[image_input, tomato_conf_slider, flower_conf_slider],
+                  outputs=[image_output, results_md])
+    gr.Markdown("---\n**API:** `POST /api/classify` · **Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)")
 
-    run_btn.click(
-        fn=_gradio_predict,
-        inputs=[image_input, tomato_conf_slider, flower_conf_slider],
-        outputs=[image_output, results_md],
-    )
-
-    gr.Markdown("""
----
-**API:** `POST /api/classify` — see Space source for request/response format.
-**Models:** SAM3 (tomatoes, zero-shot) · YOLOv8n-C3TR mAP@50=0.902 (flowers)
-**Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)
-    """)
-
-# Mount Gradio on the FastAPI app — Gradio UI at /, API routes at /api/*
 app = gr.mount_gradio_app(fapp, demo, path="/")
