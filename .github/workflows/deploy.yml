@@ -27,8 +27,7 @@ jobs:
           cd /tmp/hf-space
           find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
 
-          cp -R "$GITHUB_WORKSPACE/." .
-          rm -rf .github
+          rsync -av --exclude='.git' --exclude='.github' "$GITHUB_WORKSPACE/" .
 
           git add -A
           if git diff --cached --quiet; then
