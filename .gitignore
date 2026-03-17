@@ -1,0 +1,14 @@
+# Models (too large for git — downloaded at runtime from HuggingFace)
+gradio_demo/models/
+*.pt
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Env
+.env
