@@ -2,6 +2,7 @@ ultralytics
 huggingface_hub
 gradio
 spaces
+pyaudioop
 opencv-python-headless
 Pillow
 numpy
