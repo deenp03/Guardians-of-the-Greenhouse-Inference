@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "gradio_demo/**"
+      - "GuardiansoftheGreenhouse_inference/**"
   workflow_dispatch:
 
 jobs:
@@ -32,7 +32,7 @@ jobs:
 
           # Copy gradio_demo contents to Space root
           # HF Spaces expects app.py + requirements.txt at root level
-          cp -R "$GITHUB_WORKSPACE/gradio_demo/." .
+          cp -R "$GITHUB_WORKSPACE/GuardiansoftheGreenhouse_inference/." .
 
           # Configure git and push
           git add -A
