@@ -39,3 +39,50 @@ jobs:
             git push
             echo "Deployed successfully."
           fi
+
+      - name: Wait for Space to be Running
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          SPACE_ID: "deenp03/Guardians-of-the-Greenhouse-Inference"
+        run: |
+          pip install -q huggingface_hub
+
+          python -c "
+          import time, os, sys
+          from huggingface_hub import HfApi
+
+          api     = HfApi(token=os.environ['HF_TOKEN'])
+          repo_id = os.environ['SPACE_ID']
+
+          print('Waiting for Space to reach RUNNING state...')
+
+          start = time.time()
+          while True:
+              if time.time() - start > 900:
+                  print('Timeout: Space took too long to start.')
+                  sys.exit(1)
+
+              try:
+                  info  = api.space_info(repo_id=repo_id)
+                  stage = info.runtime.stage
+                  print(f'  Status: {stage}')
+
+                  if stage == 'RUNNING':
+                      print('Space is live!')
+                      sys.exit(0)
+
+                  if stage in ('BUILD_ERROR', 'RUNTIME_ERROR', 'CONFIG_ERROR'):
+                      print(f'Deployment failed with stage: {stage}')
+                      sys.exit(1)
+
+              except Exception as e:
+                  print(f'  Error querying API: {e}')
+
+              time.sleep(15)
+          "
+
+      - name: Verify health endpoint
+        run: |
+          curl --fail --retry 5 --retry-delay 10 \
+            https://deenp03-guardians-of-the-greenhouse-inference.hf.space/api/health
+          echo "Health check passed."
