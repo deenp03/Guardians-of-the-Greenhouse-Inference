@@ -33,10 +33,11 @@ import gradio as gr
 import numpy as np
 import spaces
 import torch
-from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import JSONResponse
 from huggingface_hub import hf_hub_download, login
 from PIL import Image, ImageDraw, ImageFont
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route
 from ultralytics import YOLO
 from ultralytics.models.sam import SAM3SemanticPredictor
 
@@ -213,27 +214,21 @@ def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# REST API handlers (Starlette-style so they work inside demo.launch app_kwargs)
 # ---------------------------------------------------------------------------
-fapp = FastAPI()
-
-
-@fapp.post("/api/classify")
-async def classify(
-    file: UploadFile = File(...),
-    tomato_conf: float = Form(0.30),
-    flower_conf: float = Form(0.25),
-):
-    image_bytes = await file.read()
-    img_np = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-    result = _run_inference(img_np, tomato_conf, flower_conf)
+async def _api_classify(request: Request):
+    form        = await request.form()
+    image_bytes = await form["file"].read()
+    tomato_conf = float(form.get("tomato_conf", 0.30))
+    flower_conf = float(form.get("flower_conf", 0.25))
+    img_np      = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
+    result      = _run_inference(img_np, tomato_conf, flower_conf)
     annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
     return JSONResponse({**result, "annotated_image_b64": annotated_b64})
 
 
-@fapp.get("/api/health")
-async def health():
-    return {"status": "ok", "models": ["sam3", "yolov8-flower"]}
+async def _api_health(request: Request):
+    return JSONResponse({"status": "ok", "models": ["sam3", "yolov8-flower"]})
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +279,13 @@ with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
                   outputs=[image_output, results_md])
     gr.Markdown("---\n**API:** `POST /api/classify` · **Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)")
 
-app = gr.mount_gradio_app(fapp, demo, path="/")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=7860)
+demo.launch(
+    server_name="0.0.0.0",
+    server_port=7860,
+    app_kwargs={
+        "routes": [
+            Route("/api/classify", _api_classify, methods=["POST"]),
+            Route("/api/health",   _api_health,   methods=["GET"]),
+        ]
+    },
+)
