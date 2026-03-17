@@ -3,8 +3,6 @@ name: Deploy to Hugging Face Spaces
 on:
   push:
     branches: [main]
-    paths:
-      - "GuardiansoftheGreenhouse_inference/**"
   workflow_dispatch:
 
 jobs:
@@ -26,15 +24,12 @@ jobs:
         run: |
           git clone https://deenp03:${HF_TOKEN}@huggingface.co/spaces/deenp03/Guardians-of-the-Greenhouse-Inference /tmp/hf-space
 
-          # Clear old content (preserve .git)
           cd /tmp/hf-space
           find . -maxdepth 1 ! -name '.git' ! -name '.' -exec rm -rf {} +
 
-          # Copy gradio_demo contents to Space root
-          # HF Spaces expects app.py + requirements.txt at root level
-          cp -R "$GITHUB_WORKSPACE/GuardiansoftheGreenhouse_inference/." .
+          cp -R "$GITHUB_WORKSPACE/." .
+          rm -rf .github
 
-          # Configure git and push
           git add -A
           if git diff --cached --quiet; then
             echo "No changes to deploy."
