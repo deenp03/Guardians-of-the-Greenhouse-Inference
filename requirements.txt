@@ -1,4 +1,5 @@
 ultralytics
+filelock
 huggingface_hub
 opencv-python-headless
 Pillow

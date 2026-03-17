@@ -74,18 +74,21 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 if HF_TOKEN:
     login(token=HF_TOKEN, add_to_git_credential=False)
 
-SAM3_PATH = os.path.join(MODELS_DIR, "sam3.pt")
-if not os.path.exists(SAM3_PATH):
-    print("Downloading SAM3 ...")
-    hf_hub_download(repo_id="facebook/sam3", filename="sam3.pt", local_dir=MODELS_DIR)
+import filelock
 
+SAM3_PATH   = os.path.join(MODELS_DIR, "sam3.pt")
 FLOWER_PATH = os.path.join(MODELS_DIR, "best.pt")
-if not os.path.exists(FLOWER_PATH):
-    print("Downloading flower model ...")
-    hf_hub_download(
-        repo_id="deenp03/tomato_pollination_stage_classifier",
-        filename="best.pt", local_dir=MODELS_DIR,
-    )
+
+with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
+    if not os.path.exists(SAM3_PATH):
+        print("Downloading SAM3 ...")
+        hf_hub_download(repo_id="facebook/sam3", filename="sam3.pt", local_dir=MODELS_DIR)
+    if not os.path.exists(FLOWER_PATH):
+        print("Downloading flower model ...")
+        hf_hub_download(
+            repo_id="deenp03/tomato_pollination_stage_classifier",
+            filename="best.pt", local_dir=MODELS_DIR,
+        )
 
 print("Weights ready. Models will load on first inference request.")
 
