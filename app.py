@@ -285,3 +285,7 @@ with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
     gr.Markdown("---\n**API:** `POST /api/classify` · **Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)")
 
 app = gr.mount_gradio_app(fapp, demo, path="/")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=7860)
