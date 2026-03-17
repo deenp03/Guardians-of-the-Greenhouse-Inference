@@ -1,6 +1,6 @@
 ---
-title: Guardians of the Greenhouse
-emoji: 🌿
+title: Guardians of the Greenhouse Inference
+emoji: 🍅
 colorFrom: green
 colorTo: red
 sdk: gradio
@@ -10,6 +10,6 @@ pinned: false
 license: mit
 ---
 
-# Greenhouse Guardians
+# Guardians of the Greenhouse
 
 Tomato ripeness detection (SAM3) + flower pollination stage detection (YOLOv8).
