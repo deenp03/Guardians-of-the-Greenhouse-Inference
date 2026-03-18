@@ -331,13 +331,13 @@ def _gradio_predict(pil_img, tomato_conf, flower_conf):
 
 
 with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (SAM3) + **Flower Stage** (YOLOv8) Detection")
+    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (Segmented YOLOv8) + **Flower Stage** (YOLOv8) Detection")
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(type="pil", label="Upload Plant Image")
             with gr.Accordion("Confidence thresholds", open=False):
                 tomato_conf_slider = gr.Slider(0.10, 0.80, value=0.30, step=0.05,
-                    label="Tomato (SAM3)",
+                    label="Tomato (Segmented YOLOv8)",
                     info="Raise to remove false positives on background/wall.")
                 flower_conf_slider = gr.Slider(0.10, 0.80, value=0.25, step=0.05,
                     label="Flower (YOLOv8)")
