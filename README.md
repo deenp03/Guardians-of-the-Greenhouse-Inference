@@ -24,7 +24,6 @@ Base URL: `https://deenp03-guardians-of-the-greenhouse-inference.hf.space`
 |---|---|---|
 | `POST` | `/api/tomatoes` | SAM3 tomato ripeness only |
 | `POST` | `/api/flowers` | YOLOv8 flower stage only |
-| `POST` | `/api/classify` | Both models combined |
 | `GET` | `/api/health` | Service status |
 
 ---
@@ -101,25 +100,6 @@ curl -X POST .../api/flowers -F "file=@plant.jpg" -F "flower_conf=0.25"
 ```
 
 **Stages:** `0` = Bud · `1` = Anthesis (ready to pollinate) · `2` = Post-Anthesis
-
----
-
-### `POST /api/classify`
-
-Both models in one call. Response contains both `tomatoes` and `flowers` fields from above, plus `annotated_image_b64`.
-
-**Example (Python)**
-```python
-import httpx
-
-with open("plant.jpg", "rb") as f:
-    r = httpx.post(
-        "https://deenp03-guardians-of-the-greenhouse-inference.hf.space/api/classify",
-        files={"file": f},
-        data={"tomato_conf": 0.35, "flower_conf": 0.25},
-    )
-result = r.json()
-```
 
 ---
 

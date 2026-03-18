@@ -317,14 +317,6 @@ async def _api_flowers(request: Request):
     return JSONResponse({**result, "annotated_image_b64": annotated_b64})
 
 
-# POST /api/classify — both models combined (backwards compatible)
-async def _api_classify(request: Request):
-    img_np, tomato_conf, flower_conf = await _parse_request(request)
-    result        = _run_inference(img_np, tomato_conf, flower_conf, mode="both")
-    annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
-    return JSONResponse({**result, "annotated_image_b64": annotated_b64})
-
-
 async def _api_health(request: Request):
     return JSONResponse({
         "status": "ok",
@@ -389,7 +381,6 @@ demo.launch(
         "routes": [
             Route("/api/tomatoes", _api_tomatoes, methods=["POST"]),
             Route("/api/flowers",  _api_flowers,  methods=["POST"]),
-            Route("/api/classify", _api_classify, methods=["POST"]),
             Route("/api/health",   _api_health,   methods=["GET"]),
         ]
     },
