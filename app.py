@@ -121,21 +121,50 @@ def _get_models():
 # ---------------------------------------------------------------------------
 def _draw_boxes(pil_img: Image.Image, boxes: list[dict]) -> Image.Image:
     img = pil_img.copy().convert("RGB")
-    draw = ImageDraw.Draw(img)
+
+    # Scale thickness and font to image size so boxes are visible at any resolution
+    w, h   = img.size
+    scale  = max(w, h) / 800
+    lw     = max(3, int(4 * scale))
+    fsize  = max(16, int(18 * scale))
+
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", fsize)
     except Exception:
         font = ImageFont.load_default()
 
+    # Semi-transparent fill layer
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ov      = ImageDraw.Draw(overlay)
+    draw    = ImageDraw.Draw(img)
+
     for b in boxes:
         x1, y1, x2, y2 = b["x1"], b["y1"], b["x2"], b["y2"]
-        color, label = b["color"], b["label"]
-        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
-        tb = draw.textbbox((x1, y1), label, font=font)
-        draw.rectangle([tb[0]-2, tb[1]-2, tb[2]+2, tb[3]+2], fill=color)
+        color, label    = b["color"], b["label"]
+
+        # Filled tinted box (semi-transparent)
+        ov.rectangle([x1, y1, x2, y2], fill=(*color, 45))
+
+        # Thick solid border
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=lw)
+
+        # Label pill positioned ABOVE the box
+        tb     = draw.textbbox((0, 0), label, font=font)
+        lw2    = tb[2] - tb[0]
+        lh     = tb[3] - tb[1]
+        pad    = 4
+        lx     = max(0, int(x1))
+        ly     = max(0, int(y1) - lh - pad * 2 - lw)
+
+        draw.rounded_rectangle([lx, ly, lx + lw2 + pad*2, ly + lh + pad*2],
+                                radius=4, fill=color)
         brightness = 0.299*color[0] + 0.587*color[1] + 0.114*color[2]
-        draw.text((x1, y1 - 2), label, fill=(0,0,0) if brightness > 128 else (255,255,255), font=font)
-    return img
+        draw.text((lx + pad, ly + pad), label,
+                  fill=(0, 0, 0) if brightness > 128 else (255, 255, 255),
+                  font=font)
+
+    img = Image.alpha_composite(img.convert("RGBA"), overlay)
+    return img.convert("RGB")
 
 
 def _pil_to_b64(img: Image.Image) -> str:
