@@ -39,6 +39,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 from ultralytics import YOLO
+from ultralytics.models.sam import SAM3SemanticPredictor
 
 # ---------------------------------------------------------------------------
 # Config
@@ -59,6 +60,12 @@ FLOWER_COLORS = {
     1: (155,  89, 182),
     2: (230, 126,  34),
 }
+
+SAM3_PROMPTS = [
+    "unripe green tomato",       # → class 0: Unripe
+    "half ripe orange tomato",   # → class 1: Half_Ripe
+    "ripe red tomato",           # → class 2: Ripe
+]
 
 # ---------------------------------------------------------------------------
 # Download weights at startup (small overhead, no model loaded into RAM yet)
@@ -87,23 +94,26 @@ with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
 print("Weights ready. Models will load on first inference request.")
 
 # Lazy singletons — populated on first @spaces.GPU call, not at startup
-_tomato_model = None
-_flower_model = None
+_sam3_predictor = None
+_flower_model   = None
 
 
 def _get_models():
     """Instantiate models on first call (inside GPU context). Reuse after that."""
-    global _tomato_model, _flower_model
+    global _sam3_predictor, _flower_model
 
-    if _tomato_model is None:
-        print("Loading tomato segmentation model ...")
-        _tomato_model = YOLO(TOMATO_PATH)
+    if _sam3_predictor is None:
+        print("Loading SAM3 into GPU memory ...")
+        _sam3_predictor = SAM3SemanticPredictor(overrides=dict(
+            conf=0.30, task="segment", mode="predict",
+            model=TOMATO_PATH, half=True, verbose=False,
+        ))
 
     if _flower_model is None:
         print("Loading flower model ...")
         _flower_model = YOLO(FLOWER_PATH)
 
-    return _tomato_model, _flower_model
+    return _sam3_predictor, _flower_model
 
 
 # ---------------------------------------------------------------------------
@@ -137,21 +147,24 @@ def _pil_to_b64(img: Image.Image) -> str:
 # ---------------------------------------------------------------------------
 # Core inference — models loaded here inside the GPU context, not at startup
 # ---------------------------------------------------------------------------
-@spaces.GPU(duration=60)
+@spaces.GPU(duration=120)
 def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
-    tomato, flower = _get_models()
+    sam3, flower = _get_models()
     pil_img    = Image.fromarray(img_np)
     draw_boxes = []
 
-    # --- YOLO Segmentation: Tomato Ripeness ---
+    # --- SAM3: Tomato Ripeness ---
     tomato_detections = []
     tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
 
-    for result in tomato(img_np, verbose=False, conf=tomato_conf):
-        if result.boxes is None:
+    sam3.set_image(img_np)
+    for result in sam3(text=SAM3_PROMPTS):
+        if result.boxes is None or len(result.boxes) == 0:
             continue
         for box in result.boxes:
-            conf   = float(box.conf[0])
+            conf = float(box.conf[0])
+            if conf < tomato_conf:
+                continue
             cls_id = int(box.cls[0])
             label  = TOMATO_CLASSES.get(cls_id, f"class_{cls_id}")
             x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
@@ -215,7 +228,7 @@ async def _api_classify(request: Request):
 
 
 async def _api_health(request: Request):
-    return JSONResponse({"status": "ok", "models": ["yolov8-tomato-seg", "yolov8-flower"]})
+    return JSONResponse({"status": "ok", "models": ["sam3", "yolov8-flower"]})
 
 
 # ---------------------------------------------------------------------------
@@ -247,13 +260,13 @@ def _gradio_predict(pil_img, tomato_conf, flower_conf):
 
 
 with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (YOLOv8-Seg) + **Flower Stage** (YOLOv8) Detection")
+    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (SAM3) + **Flower Stage** (YOLOv8) Detection")
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(type="pil", label="Upload Plant Image")
             with gr.Accordion("Confidence thresholds", open=False):
                 tomato_conf_slider = gr.Slider(0.10, 0.80, value=0.30, step=0.05,
-                    label="Tomato (YOLOv8-Seg)",
+                    label="Tomato (SAM3)",
                     info="Raise to remove false positives on background/wall.")
                 flower_conf_slider = gr.Slider(0.10, 0.80, value=0.25, step=0.05,
                     label="Flower (YOLOv8)")
