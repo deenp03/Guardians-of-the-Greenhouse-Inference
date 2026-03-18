@@ -438,39 +438,72 @@ async def _api_health(request: Request):
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
-def _gradio_predict(pil_img, tomato_conf, flower_conf):
+def _gradio_predict(pil_img, tomato_conf, flower_conf, tomato_mode):
     if pil_img is None:
         return None, "Upload an image first."
-    result = _run_inference(np.array(pil_img.convert("RGB")), tomato_conf, flower_conf)
-    tc = result["tomatoes"]["summary"]["by_class"]
-    fc = result["flowers"]["stage_counts"]
+
+    img_np = np.array(pil_img.convert("RGB"))
+
+    if tomato_mode == "Segmentation masks":
+        seg    = _run_segment(img_np, tomato_conf)
+        boxes  = _run_inference(img_np, tomato_conf, flower_conf, mode="flowers")
+        # Merge the two annotated images: draw flower boxes on top of the mask image
+        flower_boxes = []
+        for r in boxes["flowers"]["flowers"]:
+            x1, y1, x2, y2 = r["bounding_box"]
+            stage = r["stage"]
+            flower_boxes.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "color": FLOWER_COLORS.get(stage, (200, 200, 200)),
+                "label": f"{FLOWER_CLASSES.get(stage, f'stage_{stage}')} {r['confidence']:.2f}",
+            })
+        annotated = _draw_boxes(seg["annotated_pil"], flower_boxes)
+        tc = {d["label"]: 0 for d in seg["detections"]}
+        for d in seg["detections"]:
+            tc[d["label"]] = tc.get(d["label"], 0) + 1
+        fc = boxes["flowers"]["stage_counts"]
+        total_tomatoes = seg["total"]
+        total_flowers  = boxes["flowers"]["total_flowers"]
+    else:
+        result = _run_inference(img_np, tomato_conf, flower_conf, mode="both")
+        annotated      = result["annotated_pil"]
+        tc             = result["tomatoes"]["summary"]["by_class"]
+        fc             = result["flowers"]["stage_counts"]
+        total_tomatoes = result["tomatoes"]["summary"]["total"]
+        total_flowers  = result["flowers"]["total_flowers"]
+
     summary = f"""
 ## Results
-### Tomatoes — {result['tomatoes']['summary']['total']} detected
+### Tomatoes — {total_tomatoes} detected
 | Stage | Count |
 |---|---|
 | 🟢 Unripe | {tc.get('Unripe', 0)} |
 | 🟠 Half-Ripe | {tc.get('Half_Ripe', 0)} |
 | 🔴 Ripe | {tc.get('Ripe', 0)} |
 
-### Flowers — {result['flowers']['total_flowers']} detected
+### Flowers — {total_flowers} detected
 | Stage | Count |
 |---|---|
 | 🔵 Bud | {fc.get('0', 0)} |
 | 🟣 Anthesis (ready to pollinate) | {fc.get('1', 0)} |
 | 🟤 Post-Anthesis | {fc.get('2', 0)} |
 """
-    return result["annotated_pil"], summary
+    return annotated, summary
 
 
 with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (Segmented YOLOv8) + **Flower Stage** (YOLOv8) Detection")
+    gr.Markdown("# 🌿 Greenhouse Guardians\n**Tomato Ripeness** (SAM3) + **Flower Stage** (YOLOv8) Detection")
     with gr.Row():
         with gr.Column(scale=1):
             image_input = gr.Image(type="pil", label="Upload Plant Image")
+            tomato_mode = gr.Radio(
+                choices=["Bounding boxes", "Segmentation masks"],
+                value="Bounding boxes",
+                label="Tomato annotation style",
+            )
             with gr.Accordion("Confidence thresholds", open=False):
                 tomato_conf_slider = gr.Slider(0.10, 0.80, value=0.30, step=0.05,
-                    label="Tomato (Segmented YOLOv8)",
+                    label="Tomato (SAM3)",
                     info="Raise to remove false positives on background/wall.")
                 flower_conf_slider = gr.Slider(0.10, 0.80, value=0.25, step=0.05,
                     label="Flower (YOLOv8)")
@@ -479,9 +512,9 @@ with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
             image_output = gr.Image(type="pil", label="Annotated Result")
             results_md   = gr.Markdown()
     run_btn.click(fn=_gradio_predict,
-                  inputs=[image_input, tomato_conf_slider, flower_conf_slider],
+                  inputs=[image_input, tomato_conf_slider, flower_conf_slider, tomato_mode],
                   outputs=[image_output, results_md])
-    gr.Markdown("---\n**API:** `POST /api/classify` · **Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)")
+    gr.Markdown("---\n**API:** `POST /api/tomatoes` · `POST /api/flowers` · `POST /api/segment` · **Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)")
 
 demo.queue(max_size=20)
 demo.launch(
