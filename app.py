@@ -197,69 +197,76 @@ def _pil_to_b64(img: Image.Image) -> str:
 
 # ---------------------------------------------------------------------------
 # Core inference logic (hardware-agnostic)
+# mode: "tomatoes" | "flowers" | "both"
 # ---------------------------------------------------------------------------
-def _infer(sam3, flower, img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
+def _infer(sam3, flower, img_np: np.ndarray,
+           tomato_conf: float, flower_conf: float,
+           mode: str = "both") -> dict:
     pil_img    = Image.fromarray(img_np)
     draw_boxes = []
+    result     = {}
 
     # --- SAM3: Tomato Ripeness ---
-    tomato_detections = []
-    tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
+    if mode in ("tomatoes", "both"):
+        tomato_detections = []
+        tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
 
-    sam3.set_image(img_np)
-    for result in sam3(text=SAM3_PROMPTS):
-        if result.boxes is None or len(result.boxes) == 0:
-            continue
-        for box in result.boxes:
-            conf = float(box.conf[0])
-            if conf < tomato_conf:
+        sam3.set_image(img_np)
+        for r in sam3(text=SAM3_PROMPTS):
+            if r.boxes is None or len(r.boxes) == 0:
                 continue
-            cls_id = int(box.cls[0])
-            label  = TOMATO_CLASSES.get(cls_id, f"class_{cls_id}")
-            x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
-            tomato_detections.append({
-                "class_id": cls_id, "label": label,
-                "confidence": round(conf, 4),
-                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-            })
-            tomato_by_class[label] = tomato_by_class.get(label, 0) + 1
-            draw_boxes.append({
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "color": TOMATO_COLORS.get(label, (200, 200, 200)),
-                "label": f"{label} {conf:.2f}",
-            })
+            for box in r.boxes:
+                conf = float(box.conf[0])
+                if conf < tomato_conf:
+                    continue
+                cls_id = int(box.cls[0])
+                label  = TOMATO_CLASSES.get(cls_id, f"class_{cls_id}")
+                x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
+                tomato_detections.append({
+                    "class_id": cls_id, "label": label,
+                    "confidence": round(conf, 4),
+                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+                })
+                tomato_by_class[label] = tomato_by_class.get(label, 0) + 1
+                draw_boxes.append({
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "color": TOMATO_COLORS.get(label, (200, 200, 200)),
+                    "label": f"{label} {conf:.2f}",
+                })
 
-    # --- YOLOv8: Flower Stages ---
-    flower_detections = []
-    stage_counts      = {"0": 0, "1": 0, "2": 0}
-
-    for result in flower(img_np, verbose=False, conf=flower_conf):
-        if result.boxes is None:
-            continue
-        for box in result.boxes:
-            conf  = round(float(box.conf[0]), 4)
-            stage = int(box.cls[0])
-            x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
-            flower_detections.append({"bounding_box": [x1, y1, x2, y2], "stage": stage, "confidence": conf})
-            stage_counts[str(stage)] = stage_counts.get(str(stage), 0) + 1
-            draw_boxes.append({
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "color": FLOWER_COLORS.get(stage, (200, 200, 200)),
-                "label": f"{FLOWER_CLASSES.get(stage, f'stage_{stage}')} {conf:.2f}",
-            })
-
-    return {
-        "tomatoes": {
+        result["tomatoes"] = {
             "detections": tomato_detections,
             "summary": {"total": len(tomato_detections), "by_class": tomato_by_class},
-        },
-        "flowers": {
+        }
+
+    # --- YOLOv8: Flower Stages ---
+    if mode in ("flowers", "both"):
+        flower_detections = []
+        stage_counts      = {"0": 0, "1": 0, "2": 0}
+
+        for r in flower(img_np, verbose=False, conf=flower_conf):
+            if r.boxes is None:
+                continue
+            for box in r.boxes:
+                conf  = round(float(box.conf[0]), 4)
+                stage = int(box.cls[0])
+                x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
+                flower_detections.append({"bounding_box": [x1, y1, x2, y2], "stage": stage, "confidence": conf})
+                stage_counts[str(stage)] = stage_counts.get(str(stage), 0) + 1
+                draw_boxes.append({
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "color": FLOWER_COLORS.get(stage, (200, 200, 200)),
+                    "label": f"{FLOWER_CLASSES.get(stage, f'stage_{stage}')} {conf:.2f}",
+                })
+
+        result["flowers"] = {
             "flowers": flower_detections,
             "total_flowers": len(flower_detections),
             "stage_counts": stage_counts,
-        },
-        "annotated_pil": _draw_boxes(pil_img, draw_boxes),
-    }
+        }
+
+    result["annotated_pil"] = _draw_boxes(pil_img, draw_boxes)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -267,29 +274,53 @@ def _infer(sam3, flower, img_np: np.ndarray, tomato_conf: float, flower_conf: fl
 # ---------------------------------------------------------------------------
 if ZEROGPU_MODE:
     @spaces.GPU(duration=120)
-    def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
+    def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float,
+                       mode: str = "both") -> dict:
         sam3, flower = _get_zerogpu_models()
-        return _infer(sam3, flower, img_np, tomato_conf, flower_conf)
+        return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
 
 else:
-    def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
-        sam3, flower = _pool.get()          # blocks until a free instance is available
+    def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float,
+                       mode: str = "both") -> dict:
+        sam3, flower = _pool.get()
         try:
-            return _infer(sam3, flower, img_np, tomato_conf, flower_conf)
+            return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
         finally:
-            _pool.put((sam3, flower))       # always return to pool
+            _pool.put((sam3, flower))
 
 
 # ---------------------------------------------------------------------------
-# REST API handlers
+# REST API helpers
 # ---------------------------------------------------------------------------
-async def _api_classify(request: Request):
+async def _parse_request(request: Request):
     form        = await request.form()
     image_bytes = await form["file"].read()
     tomato_conf = float(form.get("tomato_conf", 0.30))
     flower_conf = float(form.get("flower_conf", 0.25))
     img_np      = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
-    result      = _run_inference(img_np, tomato_conf, flower_conf)
+    return img_np, tomato_conf, flower_conf
+
+
+# POST /api/tomatoes — SAM3 ripeness only
+async def _api_tomatoes(request: Request):
+    img_np, tomato_conf, flower_conf = await _parse_request(request)
+    result        = _run_inference(img_np, tomato_conf, flower_conf, mode="tomatoes")
+    annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
+    return JSONResponse({**result, "annotated_image_b64": annotated_b64})
+
+
+# POST /api/flowers — YOLOv8 flower stages only
+async def _api_flowers(request: Request):
+    img_np, tomato_conf, flower_conf = await _parse_request(request)
+    result        = _run_inference(img_np, tomato_conf, flower_conf, mode="flowers")
+    annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
+    return JSONResponse({**result, "annotated_image_b64": annotated_b64})
+
+
+# POST /api/classify — both models combined (backwards compatible)
+async def _api_classify(request: Request):
+    img_np, tomato_conf, flower_conf = await _parse_request(request)
+    result        = _run_inference(img_np, tomato_conf, flower_conf, mode="both")
     annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
     return JSONResponse({**result, "annotated_image_b64": annotated_b64})
 
@@ -356,6 +387,8 @@ demo.launch(
     server_port=7860,
     app_kwargs={
         "routes": [
+            Route("/api/tomatoes", _api_tomatoes, methods=["POST"]),
+            Route("/api/flowers",  _api_flowers,  methods=["POST"]),
             Route("/api/classify", _api_classify, methods=["POST"]),
             Route("/api/health",   _api_health,   methods=["GET"]),
         ]

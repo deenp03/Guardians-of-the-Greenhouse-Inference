@@ -16,40 +16,41 @@ Tomato ripeness detection (SAM3) + flower pollination stage detection (YOLOv8).
 
 ## API
 
-### `POST /api/classify`
+Base URL: `https://deenp03-guardians-of-the-greenhouse-inference.hf.space`
 
-Runs SAM3 tomato ripeness detection + YOLOv8 flower stage detection on an uploaded image.
+### Endpoints
 
-**Request**
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/tomatoes` | SAM3 tomato ripeness only |
+| `POST` | `/api/flowers` | YOLOv8 flower stage only |
+| `POST` | `/api/classify` | Both models combined |
+| `GET` | `/api/health` | Service status |
+
+---
+
+### Shared request format
+
+All `POST` endpoints accept `multipart/form-data`:
 
 | Field | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `file` | image file | ✅ | — | JPEG/PNG plant image |
-| `tomato_conf` | float | ❌ | `0.30` | Confidence threshold for tomato detections (0.10–0.80). Raise to reduce false positives. |
-| `flower_conf` | float | ❌ | `0.25` | Confidence threshold for flower detections (0.10–0.80). |
+| `tomato_conf` | float | ❌ | `0.30` | SAM3 confidence threshold (0.10–0.80). Raise to reduce false positives. |
+| `flower_conf` | float | ❌ | `0.25` | YOLOv8 confidence threshold (0.10–0.80). |
 
-**Example request (curl)**
+> `tomato_conf` is ignored by `/api/flowers` and `flower_conf` is ignored by `/api/tomatoes`.
+
+---
+
+### `POST /api/tomatoes`
+
+**Example**
 ```bash
-curl -X POST https://deenp03-guardians-of-the-greenhouse-inference.hf.space/api/classify \
-  -F "file=@plant.jpg" \
-  -F "tomato_conf=0.35" \
-  -F "flower_conf=0.25"
+curl -X POST .../api/tomatoes -F "file=@plant.jpg" -F "tomato_conf=0.35"
 ```
 
-**Example request (Python)**
-```python
-import httpx
-
-with open("plant.jpg", "rb") as f:
-    r = httpx.post(
-        "https://deenp03-guardians-of-the-greenhouse-inference.hf.space/api/classify",
-        files={"file": f},
-        data={"tomato_conf": 0.35, "flower_conf": 0.25},
-    )
-result = r.json()
-```
-
-**Response `200 OK`**
+**Response**
 ```json
 {
   "tomatoes": {
@@ -66,6 +67,24 @@ result = r.json()
       "by_class": { "Ripe": 0, "Half_Ripe": 1, "Unripe": 2 }
     }
   },
+  "annotated_image_b64": "<base64 JPEG>"
+}
+```
+
+**Labels:** `Unripe` · `Half_Ripe` · `Ripe`
+
+---
+
+### `POST /api/flowers`
+
+**Example**
+```bash
+curl -X POST .../api/flowers -F "file=@plant.jpg" -F "flower_conf=0.25"
+```
+
+**Response**
+```json
+{
   "flowers": {
     "flowers": [
       {
@@ -77,19 +96,34 @@ result = r.json()
     "total_flowers": 1,
     "stage_counts": { "0": 0, "1": 1, "2": 0 }
   },
-  "annotated_image_b64": "<base64-encoded JPEG with bounding boxes drawn>"
+  "annotated_image_b64": "<base64 JPEG>"
 }
 ```
 
-**Tomato labels:** `Unripe` · `Half_Ripe` · `Ripe`
+**Stages:** `0` = Bud · `1` = Anthesis (ready to pollinate) · `2` = Post-Anthesis
 
-**Flower stages:** `0` = Bud · `1` = Anthesis (ready to pollinate) · `2` = Post-Anthesis
+---
+
+### `POST /api/classify`
+
+Both models in one call. Response contains both `tomatoes` and `flowers` fields from above, plus `annotated_image_b64`.
+
+**Example (Python)**
+```python
+import httpx
+
+with open("plant.jpg", "rb") as f:
+    r = httpx.post(
+        "https://deenp03-guardians-of-the-greenhouse-inference.hf.space/api/classify",
+        files={"file": f},
+        data={"tomato_conf": 0.35, "flower_conf": 0.25},
+    )
+result = r.json()
+```
 
 ---
 
 ### `GET /api/health`
-
-Returns service status.
 
 ```json
 { "status": "ok", "models": ["sam3", "yolov8-flower"], "mode": "zerogpu" }
