@@ -190,13 +190,14 @@ def _draw_boxes(pil_img: Image.Image, boxes: list[dict]) -> Image.Image:
 
 
 def _draw_masks(pil_img: Image.Image, masks: list[dict]) -> Image.Image:
-    """Draw precise segmentation polygon outlines from SAM3 mask contours."""
+    """Draw segmentation outlines with leader lines to a side label column."""
     img = pil_img.copy().convert("RGB")
 
-    w, h   = img.size
-    scale  = max(w, h) / 800
-    lw     = max(2, int(3 * scale))
-    fsize  = max(14, int(16 * scale))
+    w, h  = img.size
+    scale = max(w, h) / 800
+    lw    = max(2, int(3 * scale))
+    fsize = max(14, int(16 * scale))
+    pad   = 6
 
     try:
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", fsize)
@@ -207,36 +208,85 @@ def _draw_masks(pil_img: Image.Image, masks: list[dict]) -> Image.Image:
     ov      = ImageDraw.Draw(overlay)
     draw    = ImageDraw.Draw(img)
 
+    # First pass — draw polygons and collect centroids
+    items = []
     for m in masks:
-        pts    = [(float(x), float(y)) for x, y in m["polygon"]]
-        color  = m["color"]
-        label  = m["label"]
-
+        pts   = [(float(x), float(y)) for x, y in m["polygon"]]
+        color = m["color"]
+        label = m["label"]
         if len(pts) < 3:
             continue
 
-        # Semi-transparent fill inside the contour
         ov.polygon(pts, fill=(*color, 80))
-        # Dark shadow outline first for contrast against any background
         draw.polygon(pts, outline=(0, 0, 0), width=lw + 4)
-        # Colored outline on top
         draw.polygon(pts, outline=color, width=lw)
 
-        # Label at centroid of the polygon
-        cx  = int(sum(x for x, _ in pts) / len(pts))
-        cy  = int(sum(y for _, y in pts) / len(pts))
-        tb  = draw.textbbox((0, 0), label, font=font)
-        lw2 = tb[2] - tb[0]
-        lh  = tb[3] - tb[1]
-        pad = 4
-        lx  = max(0, cx - lw2 // 2)
-        ly  = max(0, cy - lh  // 2)
-        draw.rounded_rectangle([lx - pad, ly - pad, lx + lw2 + pad, ly + lh + pad],
-                                radius=4, fill=color)
+        cx = int(sum(x for x, _ in pts) / len(pts))
+        cy = int(sum(y for _, y in pts) / len(pts))
+        items.append((cx, cy, color, label))
+
+    if not items:
+        img = Image.alpha_composite(img.convert("RGBA"), overlay)
+        return img.convert("RGB")
+
+    # Sort top-to-bottom so label column reads naturally
+    items.sort(key=lambda t: t[1])
+
+    # Measure labels to size the column
+    max_lw = max(draw.textbbox((0, 0), lbl, font=font)[2] for *_, lbl in items)
+    lh     = draw.textbbox((0, 0), items[0][3], font=font)[3]
+    row_h  = lh + pad * 2 + 4
+
+    # Fit column height to image; shrink row spacing if needed
+    total_h = len(items) * row_h
+    if total_h > h - 20:
+        row_h = max(lh + pad, (h - 20) // len(items))
+
+    # Place column on whichever side has fewer centroid points
+    left_count  = sum(1 for cx, *_ in items if cx < w // 2)
+    right_count = len(items) - left_count
+    margin = 8
+    if right_count <= left_count:          # more room on the right
+        col_x = w - max_lw - pad * 2 - margin
+        anchor_side = "left"               # line attaches to left edge of label
+    else:
+        col_x = margin
+        anchor_side = "right"
+
+    start_y = max(margin, (h - len(items) * row_h) // 2)
+
+    # Second pass — draw leader lines and labels
+    dot_r = max(4, int(6 * scale))
+    for i, (cx, cy, color, label) in enumerate(items):
+        ly   = start_y + i * row_h
+        tb   = draw.textbbox((0, 0), label, font=font)
+        lbl_w = tb[2] - tb[0]
+
+        # Label pill
+        rx1 = col_x
+        rx2 = col_x + lbl_w + pad * 2
+        ry1 = ly
+        ry2 = ly + lh + pad * 2
+        draw.rounded_rectangle([rx1, ry1, rx2, ry2], radius=4, fill=color)
         brightness = 0.299*color[0] + 0.587*color[1] + 0.114*color[2]
-        draw.text((lx, ly), label,
+        draw.text((rx1 + pad, ry1 + pad), label,
                   fill=(0, 0, 0) if brightness > 128 else (255, 255, 255),
                   font=font)
+
+        # Leader line anchor point (middle of the near edge of the label)
+        mid_y = (ry1 + ry2) // 2
+        if anchor_side == "left":
+            ax = rx1
+        else:
+            ax = rx2
+
+        # Shadow then colored line
+        draw.line([(ax, mid_y), (cx, cy)], fill=(0, 0, 0), width=3)
+        draw.line([(ax, mid_y), (cx, cy)], fill=color,    width=2)
+
+        # Dot at centroid
+        draw.ellipse([cx - dot_r, cy - dot_r, cx + dot_r, cy + dot_r],
+                     fill=color, outline=(0, 0, 0), width=2)
 
     img = Image.alpha_composite(img.convert("RGBA"), overlay)
     return img.convert("RGB")
