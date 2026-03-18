@@ -23,15 +23,20 @@ API usage:
     },
     "annotated_image_b64": "<base64-encoded JPEG>"
   }
+
+Concurrency modes (set MODEL_POOL_SIZE env var):
+  MODEL_POOL_SIZE=1  (default) — ZeroGPU mode: @spaces.GPU, lazy singleton, free H200
+  MODEL_POOL_SIZE=4             — Dedicated GPU mode: 4 pre-loaded instances, no ZeroGPU needed
 """
 
 import base64
 import io
 import os
+import queue
+import threading
 
 import gradio as gr
 import numpy as np
-import spaces
 import torch
 from huggingface_hub import hf_hub_download, login
 from PIL import Image, ImageDraw, ImageFont
@@ -44,7 +49,10 @@ from ultralytics.models.sam import SAM3SemanticPredictor
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MODELS_DIR = "models"
+MODELS_DIR      = "models"
+MODEL_POOL_SIZE = int(os.getenv("MODEL_POOL_SIZE", "1"))
+ZEROGPU_MODE    = MODEL_POOL_SIZE == 1
+
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 TOMATO_CLASSES = {0: "Unripe", 1: "Half_Ripe", 2: "Ripe"}
@@ -68,8 +76,7 @@ SAM3_PROMPTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# Download weights at startup (small overhead, no model loaded into RAM yet)
-# Models are instantiated lazily inside @spaces.GPU where GPU memory is available
+# Download weights at startup
 # ---------------------------------------------------------------------------
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 if HF_TOKEN:
@@ -91,29 +98,48 @@ with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
             filename="best.pt", local_dir=MODELS_DIR,
         )
 
-print("Weights ready. Models will load on first inference request.")
+print(f"Weights ready. Mode: {'ZeroGPU (pool=1)' if ZEROGPU_MODE else f'Dedicated GPU (pool={MODEL_POOL_SIZE})'}")
 
-# Lazy singletons — populated on first @spaces.GPU call, not at startup
-_sam3_predictor = None
-_flower_model   = None
+# ---------------------------------------------------------------------------
+# Model management
+#
+# ZeroGPU mode  (MODEL_POOL_SIZE=1):
+#   Lazy singleton loaded inside @spaces.GPU — GPU allocated per call by HF.
+#
+# Dedicated GPU mode (MODEL_POOL_SIZE>1):
+#   Pool of N model pairs pre-loaded at startup. A threading.Semaphore gates
+#   access so at most N requests run concurrently. No @spaces.GPU needed.
+# ---------------------------------------------------------------------------
+def _make_model_pair():
+    sam3 = SAM3SemanticPredictor(overrides=dict(
+        conf=0.30, task="segment", mode="predict",
+        model=TOMATO_PATH, half=True, verbose=False,
+    ))
+    flower = YOLO(FLOWER_PATH)
+    return sam3, flower
 
 
-def _get_models():
-    """Instantiate models on first call (inside GPU context). Reuse after that."""
-    global _sam3_predictor, _flower_model
+if ZEROGPU_MODE:
+    import spaces
 
-    if _sam3_predictor is None:
-        print("Loading SAM3 into GPU memory ...")
-        _sam3_predictor = SAM3SemanticPredictor(overrides=dict(
-            conf=0.30, task="segment", mode="predict",
-            model=TOMATO_PATH, half=True, verbose=False,
-        ))
+    # Lazy singletons — created inside the @spaces.GPU context
+    _sam3_singleton   = None
+    _flower_singleton = None
 
-    if _flower_model is None:
-        print("Loading flower model ...")
-        _flower_model = YOLO(FLOWER_PATH)
+    def _get_zerogpu_models():
+        global _sam3_singleton, _flower_singleton
+        if _sam3_singleton is None:
+            print("Loading SAM3 into GPU memory ...")
+            _sam3_singleton, _flower_singleton = _make_model_pair()
+        return _sam3_singleton, _flower_singleton
 
-    return _sam3_predictor, _flower_model
+else:
+    # Pre-load pool at startup (dedicated GPU has memory available immediately)
+    print(f"Loading {MODEL_POOL_SIZE} model instance(s) into GPU memory ...")
+    _pool: queue.Queue = queue.Queue()
+    for _ in range(MODEL_POOL_SIZE):
+        _pool.put(_make_model_pair())
+    print("Model pool ready.")
 
 
 # ---------------------------------------------------------------------------
@@ -142,13 +168,9 @@ def _draw_boxes(pil_img: Image.Image, boxes: list[dict]) -> Image.Image:
         x1, y1, x2, y2 = b["x1"], b["y1"], b["x2"], b["y2"]
         color, label    = b["color"], b["label"]
 
-        # Filled tinted box (semi-transparent)
         ov.rectangle([x1, y1, x2, y2], fill=(*color, 45))
-
-        # Thick solid border
         draw.rectangle([x1, y1, x2, y2], outline=color, width=lw)
 
-        # Label pill positioned ABOVE the box
         tb     = draw.textbbox((0, 0), label, font=font)
         lw2    = tb[2] - tb[0]
         lh     = tb[3] - tb[1]
@@ -174,11 +196,9 @@ def _pil_to_b64(img: Image.Image) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Core inference — models loaded here inside the GPU context, not at startup
+# Core inference logic (hardware-agnostic)
 # ---------------------------------------------------------------------------
-@spaces.GPU(duration=120)
-def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
-    sam3, flower = _get_models()
+def _infer(sam3, flower, img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
     pil_img    = Image.fromarray(img_np)
     draw_boxes = []
 
@@ -243,7 +263,25 @@ def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -
 
 
 # ---------------------------------------------------------------------------
-# REST API handlers (Starlette-style so they work inside demo.launch app_kwargs)
+# Public inference entry point — switches on mode
+# ---------------------------------------------------------------------------
+if ZEROGPU_MODE:
+    @spaces.GPU(duration=120)
+    def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
+        sam3, flower = _get_zerogpu_models()
+        return _infer(sam3, flower, img_np, tomato_conf, flower_conf)
+
+else:
+    def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float) -> dict:
+        sam3, flower = _pool.get()          # blocks until a free instance is available
+        try:
+            return _infer(sam3, flower, img_np, tomato_conf, flower_conf)
+        finally:
+            _pool.put((sam3, flower))       # always return to pool
+
+
+# ---------------------------------------------------------------------------
+# REST API handlers
 # ---------------------------------------------------------------------------
 async def _api_classify(request: Request):
     form        = await request.form()
@@ -257,7 +295,11 @@ async def _api_classify(request: Request):
 
 
 async def _api_health(request: Request):
-    return JSONResponse({"status": "ok", "models": ["sam3", "yolov8-flower"]})
+    return JSONResponse({
+        "status": "ok",
+        "models": ["sam3", "yolov8-flower"],
+        "mode": "zerogpu" if ZEROGPU_MODE else f"dedicated-pool-{MODEL_POOL_SIZE}",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -308,6 +350,7 @@ with gr.Blocks(title="Greenhouse Guardians", theme=gr.themes.Soft()) as demo:
                   outputs=[image_output, results_md])
     gr.Markdown("---\n**API:** `POST /api/classify` · **Compute:** [ZeroGPU](https://huggingface.co/docs/hub/spaces-zerogpu) (free)")
 
+demo.queue(max_size=20)
 demo.launch(
     server_name="0.0.0.0",
     server_port=7860,
