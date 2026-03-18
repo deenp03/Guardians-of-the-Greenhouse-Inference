@@ -83,7 +83,7 @@ FLOWER_PATH = os.path.join(MODELS_DIR, "ripeness_finetuned_new.pt")
 with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
     if not os.path.exists(TOMATO_PATH):
         print("Downloading tomato segmentation model ...")
-        hf_hub_download(repo_id="deenp03/tomato_pollination_stage_classifier", filename="segment_ripeness.pt", local_dir=MODELS_DIR)
+        hf_hub_download(repo_id="deenp03/tomato-ripeness-classifier", filename="segment_ripeness.pt", local_dir=MODELS_DIR)
     if not os.path.exists(FLOWER_PATH):
         print("Downloading flower model ...")
         hf_hub_download(
