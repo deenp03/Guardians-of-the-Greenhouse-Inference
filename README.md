@@ -22,8 +22,9 @@ Base URL: `https://deenp03-guardians-of-the-greenhouse-inference.hf.space`
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/api/tomatoes` | SAM3 tomato ripeness only |
-| `POST` | `/api/flowers` | YOLOv8 flower stage only |
+| `POST` | `/api/segment` | SAM3 precise polygon masks (tomatoes) |
+| `POST` | `/api/tomatoes` | SAM3 tomato ripeness bounding boxes |
+| `POST` | `/api/flowers` | YOLOv8 flower stage bounding boxes |
 | `GET` | `/api/health` | Service status |
 
 ---
@@ -39,6 +40,35 @@ All `POST` endpoints accept `multipart/form-data`:
 | `flower_conf` | float | ❌ | `0.25` | YOLOv8 confidence threshold (0.10–0.80). |
 
 > `tomato_conf` is ignored by `/api/flowers` and `flower_conf` is ignored by `/api/tomatoes`.
+
+---
+
+### `POST /api/segment`
+
+Returns SAM3's precise polygon contours around each tomato instead of bounding boxes. Uses the same SAM3 model but exposes the actual segmentation masks.
+
+**Example**
+```bash
+curl -X POST .../api/segment -F "file=@plant.jpg" -F "tomato_conf=0.35"
+```
+
+**Response**
+```json
+{
+  "total": 3,
+  "detections": [
+    {
+      "class_id": 0,
+      "label": "Unripe",
+      "confidence": 0.8923,
+      "polygon": [[120.5, 80.2], [135.1, 78.4], [150.3, 90.1], "..."]
+    }
+  ],
+  "annotated_image_b64": "<base64 JPEG with polygon outlines>"
+}
+```
+
+`polygon` is a list of `[x, y]` pixel coordinate pairs tracing the exact boundary of the tomato.
 
 ---
 

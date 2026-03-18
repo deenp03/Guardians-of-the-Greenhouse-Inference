@@ -189,6 +189,57 @@ def _draw_boxes(pil_img: Image.Image, boxes: list[dict]) -> Image.Image:
     return img.convert("RGB")
 
 
+def _draw_masks(pil_img: Image.Image, masks: list[dict]) -> Image.Image:
+    """Draw precise segmentation polygon outlines from SAM3 mask contours."""
+    img = pil_img.copy().convert("RGB")
+
+    w, h   = img.size
+    scale  = max(w, h) / 800
+    lw     = max(2, int(3 * scale))
+    fsize  = max(14, int(16 * scale))
+
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", fsize)
+    except Exception:
+        font = ImageFont.load_default()
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ov      = ImageDraw.Draw(overlay)
+    draw    = ImageDraw.Draw(img)
+
+    for m in masks:
+        pts    = [(float(x), float(y)) for x, y in m["polygon"]]
+        color  = m["color"]
+        label  = m["label"]
+
+        if len(pts) < 3:
+            continue
+
+        # Semi-transparent fill inside the contour
+        ov.polygon(pts, fill=(*color, 60))
+        # Precise outline
+        draw.polygon(pts, outline=color, width=lw)
+
+        # Label at centroid of the polygon
+        cx  = int(sum(x for x, _ in pts) / len(pts))
+        cy  = int(sum(y for _, y in pts) / len(pts))
+        tb  = draw.textbbox((0, 0), label, font=font)
+        lw2 = tb[2] - tb[0]
+        lh  = tb[3] - tb[1]
+        pad = 4
+        lx  = max(0, cx - lw2 // 2)
+        ly  = max(0, cy - lh  // 2)
+        draw.rounded_rectangle([lx - pad, ly - pad, lx + lw2 + pad, ly + lh + pad],
+                                radius=4, fill=color)
+        brightness = 0.299*color[0] + 0.587*color[1] + 0.114*color[2]
+        draw.text((lx, ly), label,
+                  fill=(0, 0, 0) if brightness > 128 else (255, 255, 255),
+                  font=font)
+
+    img = Image.alpha_composite(img.convert("RGBA"), overlay)
+    return img.convert("RGB")
+
+
 def _pil_to_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=92)
@@ -269,6 +320,45 @@ def _infer(sam3, flower, img_np: np.ndarray,
     return result
 
 
+def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
+    """SAM3 segmentation — returns precise polygon contours instead of bounding boxes."""
+    pil_img    = Image.fromarray(img_np)
+    masks_draw = []
+    detections = []
+
+    sam3.set_image(img_np)
+    for r in sam3(text=SAM3_PROMPTS):
+        if r.boxes is None or len(r.boxes) == 0:
+            continue
+
+        # masks.xy is a list of (N,2) numpy arrays — one polygon per detection
+        polygons = r.masks.xy if r.masks is not None else [None] * len(r.boxes)
+
+        for i, box in enumerate(r.boxes):
+            conf = float(box.conf[0])
+            if conf < tomato_conf:
+                continue
+            cls_id  = int(box.cls[0])
+            label   = TOMATO_CLASSES.get(cls_id, f"class_{cls_id}")
+            color   = TOMATO_COLORS.get(label, (200, 200, 200))
+            polygon = polygons[i].tolist() if polygons[i] is not None else []
+
+            detections.append({
+                "class_id":   cls_id,
+                "label":      label,
+                "confidence": round(conf, 4),
+                "polygon":    polygon,   # list of [x, y] pixel coords
+            })
+            masks_draw.append({"polygon": polygon, "color": color,
+                                "label": f"{label} {conf:.2f}"})
+
+    return {
+        "detections":    detections,
+        "total":         len(detections),
+        "annotated_pil": _draw_masks(pil_img, masks_draw),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Public inference entry point — switches on mode
 # ---------------------------------------------------------------------------
@@ -279,12 +369,24 @@ if ZEROGPU_MODE:
         sam3, flower = _get_zerogpu_models()
         return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
 
+    @spaces.GPU(duration=120)
+    def _run_segment(img_np: np.ndarray, tomato_conf: float) -> dict:
+        sam3, _ = _get_zerogpu_models()
+        return _infer_segment(sam3, img_np, tomato_conf)
+
 else:
     def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float,
                        mode: str = "both") -> dict:
         sam3, flower = _pool.get()
         try:
             return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
+        finally:
+            _pool.put((sam3, flower))
+
+    def _run_segment(img_np: np.ndarray, tomato_conf: float) -> dict:
+        sam3, flower = _pool.get()
+        try:
+            return _infer_segment(sam3, img_np, tomato_conf)
         finally:
             _pool.put((sam3, flower))
 
@@ -299,6 +401,14 @@ async def _parse_request(request: Request):
     flower_conf = float(form.get("flower_conf", 0.25))
     img_np      = np.array(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
     return img_np, tomato_conf, flower_conf
+
+
+# POST /api/segment — SAM3 precise polygon masks (tomatoes only)
+async def _api_segment(request: Request):
+    img_np, tomato_conf, _ = await _parse_request(request)
+    result        = _run_segment(img_np, tomato_conf)
+    annotated_b64 = _pil_to_b64(result.pop("annotated_pil"))
+    return JSONResponse({**result, "annotated_image_b64": annotated_b64})
 
 
 # POST /api/tomatoes — SAM3 ripeness only
@@ -379,6 +489,7 @@ demo.launch(
     server_port=7860,
     app_kwargs={
         "routes": [
+            Route("/api/segment",  _api_segment,  methods=["POST"]),
             Route("/api/tomatoes", _api_tomatoes, methods=["POST"]),
             Route("/api/flowers",  _api_flowers,  methods=["POST"]),
             Route("/api/health",   _api_health,   methods=["GET"]),
