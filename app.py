@@ -216,8 +216,10 @@ def _draw_masks(pil_img: Image.Image, masks: list[dict]) -> Image.Image:
             continue
 
         # Semi-transparent fill inside the contour
-        ov.polygon(pts, fill=(*color, 60))
-        # Precise outline
+        ov.polygon(pts, fill=(*color, 80))
+        # Dark shadow outline first for contrast against any background
+        draw.polygon(pts, outline=(0, 0, 0), width=lw + 4)
+        # Colored outline on top
         draw.polygon(pts, outline=color, width=lw)
 
         # Label at centroid of the polygon
