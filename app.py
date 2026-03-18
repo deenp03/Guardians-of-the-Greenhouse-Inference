@@ -88,7 +88,7 @@ with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
         print("Downloading flower model ...")
         hf_hub_download(
             repo_id="deenp03/tomato_pollination_stage_classifier",
-            filename="ripeness_finetuned_new.pt", local_dir=MODELS_DIR,
+            filename="best.pt", local_dir=MODELS_DIR,
         )
 
 print("Weights ready. Models will load on first inference request.")
