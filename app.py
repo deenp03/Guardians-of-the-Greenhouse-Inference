@@ -78,7 +78,7 @@ if HF_TOKEN:
 import filelock
 
 TOMATO_PATH = os.path.join(MODELS_DIR, "segment_ripeness.pt")
-FLOWER_PATH = os.path.join(MODELS_DIR, "ripeness_finetuned_new.pt")
+FLOWER_PATH = os.path.join(MODELS_DIR, "best.pt")
 
 with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
     if not os.path.exists(TOMATO_PATH):
