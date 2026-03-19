@@ -415,13 +415,13 @@ def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
 # Public inference entry point — switches on mode
 # ---------------------------------------------------------------------------
 if ZEROGPU_MODE:
-    @spaces.GPU(duration=120)
+    @spaces.GPU(duration=30)
     def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float,
                        mode: str = "both") -> dict:
         sam3, flower = _get_zerogpu_models()
         return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
 
-    @spaces.GPU(duration=120)
+    @spaces.GPU(duration=30)
     def _run_segment(img_np: np.ndarray, tomato_conf: float) -> dict:
         sam3, _ = _get_zerogpu_models()
         return _infer_segment(sam3, img_np, tomato_conf)
