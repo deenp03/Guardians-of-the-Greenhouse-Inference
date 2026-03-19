@@ -35,6 +35,7 @@ import os
 import queue
 import threading
 
+import cv2
 import gradio as gr
 import numpy as np
 import torch
@@ -69,11 +70,9 @@ FLOWER_COLORS = {
     2: (230, 126,  34),
 }
 
-SAM3_PROMPTS = [
-    "unripe green tomato",       # → class 0: Unripe
-    "half ripe orange tomato",   # → class 1: Half_Ripe
-    "ripe red tomato",           # → class 2: Ripe
-]
+SAM3_PROMPTS = ["tomato"]   # detect all tomatoes; ripeness is classified by HSV color
+
+TOMATO_LABEL_TO_ID = {"Unripe": 0, "Half_Ripe": 1, "Ripe": 2}
 
 # ---------------------------------------------------------------------------
 # Download weights at startup
@@ -140,6 +139,39 @@ else:
     for _ in range(MODEL_POOL_SIZE):
         _pool.put(_make_model_pair())
     print("Model pool ready.")
+
+
+# ---------------------------------------------------------------------------
+# HSV ripeness classifier — called on each SAM3-detected tomato crop
+# ---------------------------------------------------------------------------
+def classify_ripeness_by_color(region_rgb: np.ndarray) -> str:
+    """
+    Classify a tomato crop as Unripe / Half_Ripe / Ripe by HSV hue distribution.
+
+    HSV hue (OpenCV 0-179):
+      Red/Ripe   : H in [0,10] or [170,180]
+      Orange/Half: H in [10,25]
+      Green/Unripe: H in [35,85]
+    Only saturated+bright pixels (tomato skin) are counted.
+    """
+    hsv = cv2.cvtColor(region_rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    mask     = (s > 60) & (v > 60)
+    h_masked = h[mask]
+
+    if len(h_masked) < 50:
+        return "Unripe"
+
+    total      = len(h_masked)
+    red_pct    = np.sum((h_masked <= 10) | (h_masked >= 170)) / total
+    orange_pct = np.sum((h_masked > 10)  & (h_masked <= 25))  / total
+
+    if red_pct >= 0.35:
+        return "Ripe"
+    if orange_pct >= 0.25 or (red_pct >= 0.20 and orange_pct >= 0.15):
+        return "Half_Ripe"
+    return "Unripe"
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +341,7 @@ def _infer(sam3, flower, img_np: np.ndarray,
     draw_boxes = []
     result     = {}
 
-    # --- SAM3: Tomato Ripeness ---
+    # --- SAM3: Tomato detection + HSV ripeness classification ---
     if mode in ("tomatoes", "both"):
         tomato_detections = []
         tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
@@ -322,9 +354,15 @@ def _infer(sam3, flower, img_np: np.ndarray,
                 conf = float(box.conf[0])
                 if conf < tomato_conf:
                     continue
-                cls_id = int(box.cls[0])
-                label  = TOMATO_CLASSES.get(cls_id, f"class_{cls_id}")
                 x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
+
+                # Crop detected region and classify by HSV color
+                ix1, iy1 = max(0, int(x1)), max(0, int(y1))
+                ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
+                crop  = img_np[iy1:iy2, ix1:ix2]
+                label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
+
+                cls_id = TOMATO_LABEL_TO_ID[label]
                 tomato_detections.append({
                     "class_id": cls_id, "label": label,
                     "confidence": round(conf, 4),
@@ -390,16 +428,23 @@ def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
             conf = float(box.conf[0])
             if conf < tomato_conf:
                 continue
-            cls_id  = int(box.cls[0])
-            label   = TOMATO_CLASSES.get(cls_id, f"class_{cls_id}")
-            color   = TOMATO_COLORS.get(label, (200, 200, 200))
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
             polygon = polygons[i].tolist() if polygons[i] is not None else []
+
+            # Crop detected region and classify by HSV color
+            ix1, iy1 = max(0, int(x1)), max(0, int(y1))
+            ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
+            crop  = img_np[iy1:iy2, ix1:ix2]
+            label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
+
+            cls_id = TOMATO_LABEL_TO_ID[label]
+            color  = TOMATO_COLORS.get(label, (200, 200, 200))
 
             detections.append({
                 "class_id":   cls_id,
                 "label":      label,
                 "confidence": round(conf, 4),
-                "polygon":    polygon,   # list of [x, y] pixel coords
+                "polygon":    polygon,
             })
             masks_draw.append({"polygon": polygon, "color": color,
                                 "label": f"{label} {conf:.2f}"})
