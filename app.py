@@ -70,7 +70,11 @@ FLOWER_COLORS = {
     2: (230, 126,  34),
 }
 
-SAM3_PROMPTS = ["tomato"]   # detect all tomatoes; ripeness is classified by HSV color
+SAM3_PROMPTS = [
+    "ripe red tomato",
+    "unripe green tomato",
+    "tomato fruit",
+]   # multiple descriptive prompts → better SAM3 grounding; ripeness via HSV later
 
 TOMATO_LABEL_TO_ID = {"Unripe": 0, "Half_Ripe": 1, "Ripe": 2}
 
@@ -172,6 +176,33 @@ def classify_ripeness_by_color(region_rgb: np.ndarray) -> str:
     if orange_pct >= 0.25 or (red_pct >= 0.20 and orange_pct >= 0.15):
         return "Half_Ripe"
     return "Unripe"
+
+
+# ---------------------------------------------------------------------------
+# IoU dedupe — collapses duplicate boxes that come from multiple SAM3 prompts
+# matching the same physical fruit
+# ---------------------------------------------------------------------------
+def _iou(a, b) -> float:
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    iw  = max(0.0, ix2 - ix1)
+    ih  = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0:
+        return 0.0
+    area_a = (a[2] - a[0]) * (a[3] - a[1])
+    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    return inter / (area_a + area_b - inter)
+
+
+def _dedupe_boxes(items: list[dict], iou_thresh: float = 0.5) -> list[dict]:
+    """Greedy NMS over confidence. Each item must have 'bbox' (xyxy tuple) and 'confidence'."""
+    items = sorted(items, key=lambda d: -d["confidence"])
+    kept: list[dict] = []
+    for it in items:
+        if all(_iou(it["bbox"], k["bbox"]) < iou_thresh for k in kept):
+            kept.append(it)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -346,6 +377,9 @@ def _infer(sam3, flower, img_np: np.ndarray,
         tomato_detections = []
         tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
 
+        # Collect raw boxes from every SAM3 text prompt; multiple prompts often
+        # detect the same fruit, so we dedupe by IoU before HSV-classifying.
+        raw: list[dict] = []
         sam3.set_image(img_np)
         for r in sam3(text=SAM3_PROMPTS):
             if r.boxes is None or len(r.boxes) == 0:
@@ -355,25 +389,30 @@ def _infer(sam3, flower, img_np: np.ndarray,
                 if conf < tomato_conf:
                     continue
                 x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
+                raw.append({"bbox": (x1, y1, x2, y2), "confidence": conf})
 
-                # Crop detected region and classify by HSV color
-                ix1, iy1 = max(0, int(x1)), max(0, int(y1))
-                ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
-                crop  = img_np[iy1:iy2, ix1:ix2]
-                label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
+        for d in _dedupe_boxes(raw, iou_thresh=0.5):
+            x1, y1, x2, y2 = d["bbox"]
+            conf = d["confidence"]
 
-                cls_id = TOMATO_LABEL_TO_ID[label]
-                tomato_detections.append({
-                    "class_id": cls_id, "label": label,
-                    "confidence": round(conf, 4),
-                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
-                })
-                tomato_by_class[label] = tomato_by_class.get(label, 0) + 1
-                draw_boxes.append({
-                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                    "color": TOMATO_COLORS.get(label, (200, 200, 200)),
-                    "label": f"{label} {conf:.2f}",
-                })
+            # Crop detected region and classify by HSV color
+            ix1, iy1 = max(0, int(x1)), max(0, int(y1))
+            ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
+            crop  = img_np[iy1:iy2, ix1:ix2]
+            label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
+
+            cls_id = TOMATO_LABEL_TO_ID[label]
+            tomato_detections.append({
+                "class_id": cls_id, "label": label,
+                "confidence": round(conf, 4),
+                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+            })
+            tomato_by_class[label] = tomato_by_class.get(label, 0) + 1
+            draw_boxes.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "color": TOMATO_COLORS.get(label, (200, 200, 200)),
+                "label": f"{label} {conf:.2f}",
+            })
 
         result["tomatoes"] = {
             "detections": tomato_detections,
@@ -416,6 +455,8 @@ def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
     masks_draw = []
     detections = []
 
+    # Collect raw box+polygon pairs from every SAM3 prompt, then dedupe.
+    raw: list[dict] = []
     sam3.set_image(img_np)
     for r in sam3(text=SAM3_PROMPTS):
         if r.boxes is None or len(r.boxes) == 0:
@@ -430,24 +471,30 @@ def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
                 continue
             x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
             polygon = polygons[i].tolist() if polygons[i] is not None else []
+            raw.append({"bbox": (x1, y1, x2, y2), "confidence": conf, "polygon": polygon})
 
-            # Crop detected region and classify by HSV color
-            ix1, iy1 = max(0, int(x1)), max(0, int(y1))
-            ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
-            crop  = img_np[iy1:iy2, ix1:ix2]
-            label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
+    for d in _dedupe_boxes(raw, iou_thresh=0.5):
+        x1, y1, x2, y2 = d["bbox"]
+        conf    = d["confidence"]
+        polygon = d["polygon"]
 
-            cls_id = TOMATO_LABEL_TO_ID[label]
-            color  = TOMATO_COLORS.get(label, (200, 200, 200))
+        # Crop detected region and classify by HSV color
+        ix1, iy1 = max(0, int(x1)), max(0, int(y1))
+        ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
+        crop  = img_np[iy1:iy2, ix1:ix2]
+        label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
 
-            detections.append({
-                "class_id":   cls_id,
-                "label":      label,
-                "confidence": round(conf, 4),
-                "polygon":    polygon,
-            })
-            masks_draw.append({"polygon": polygon, "color": color,
-                                "label": f"{label} {conf:.2f}"})
+        cls_id = TOMATO_LABEL_TO_ID[label]
+        color  = TOMATO_COLORS.get(label, (200, 200, 200))
+
+        detections.append({
+            "class_id":   cls_id,
+            "label":      label,
+            "confidence": round(conf, 4),
+            "polygon":    polygon,
+        })
+        masks_draw.append({"polygon": polygon, "color": color,
+                            "label": f"{label} {conf:.2f}"})
 
     return {
         "detections":    detections,
