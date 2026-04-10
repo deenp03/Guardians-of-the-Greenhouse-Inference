@@ -79,9 +79,9 @@ FLOWER_COLORS = {
 # where the shared "tomato" / "ripe" tokens drown the color signal and every
 # fruit ends up matching "ripe red tomato" the strongest.
 TOMATO_PROMPTS = [
-    ("a red tomato",    "Ripe"),
-    ("an orange tomato", "Half_Ripe"),
-    ("a green tomato",  "Unripe"),
+    ("a red tomato",          "Ripe"),
+    ("an orangish red tomato", "Half_Ripe"),
+    ("a green tomato",        "Unripe"),
 ]
 
 TOMATO_LABEL_TO_ID = {"Unripe": 0, "Half_Ripe": 1, "Ripe": 2}
