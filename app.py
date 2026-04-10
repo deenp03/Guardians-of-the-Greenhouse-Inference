@@ -72,10 +72,16 @@ FLOWER_COLORS = {
 # One SAM3 inference per (prompt, label). Detections from different prompts
 # that hit the same fruit are deduped by IoU; the highest-scoring prompt's
 # label wins, so ripeness comes directly from SAM3's text grounding.
+#
+# Prompts are intentionally color-first / single-adjective: SAM3's CLIP-style
+# text encoder is much more discriminative on bare color words ("red" vs
+# "orange" vs "green") than on stacked phrases like "half ripe orange tomato",
+# where the shared "tomato" / "ripe" tokens drown the color signal and every
+# fruit ends up matching "ripe red tomato" the strongest.
 TOMATO_PROMPTS = [
-    ("ripe red tomato",         "Ripe"),
-    ("half ripe orange tomato", "Half_Ripe"),
-    ("unripe green tomato",     "Unripe"),
+    ("a red tomato",    "Ripe"),
+    ("an orange tomato", "Half_Ripe"),
+    ("a green tomato",  "Unripe"),
 ]
 
 TOMATO_LABEL_TO_ID = {"Unripe": 0, "Half_Ripe": 1, "Ripe": 2}
