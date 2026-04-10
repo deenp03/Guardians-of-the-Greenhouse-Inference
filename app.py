@@ -33,7 +33,6 @@ import base64
 import io
 import os
 import queue
-import threading
 
 import cv2
 import gradio as gr
@@ -44,8 +43,8 @@ from PIL import Image, ImageDraw, ImageFont
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
+from transformers import Sam3Model, Sam3Processor
 from ultralytics import YOLO
-from ultralytics.models.sam import SAM3SemanticPredictor
 
 # ---------------------------------------------------------------------------
 # Config
@@ -70,13 +69,18 @@ FLOWER_COLORS = {
     2: (230, 126,  34),
 }
 
-SAM3_PROMPTS = [
-    "ripe red tomato",
-    "unripe green tomato",
-    "tomato fruit",
-]   # multiple descriptive prompts → better SAM3 grounding; ripeness via HSV later
+# One SAM3 inference per (prompt, label). Detections from different prompts
+# that hit the same fruit are deduped by IoU; the highest-scoring prompt's
+# label wins, so ripeness comes directly from SAM3's text grounding.
+TOMATO_PROMPTS = [
+    ("ripe red tomato",         "Ripe"),
+    ("half ripe orange tomato", "Half_Ripe"),
+    ("unripe green tomato",     "Unripe"),
+]
 
 TOMATO_LABEL_TO_ID = {"Unripe": 0, "Half_Ripe": 1, "Ripe": 2}
+
+SAM3_REPO = "facebook/sam3"
 
 # ---------------------------------------------------------------------------
 # Download weights at startup
@@ -87,19 +91,16 @@ if HF_TOKEN:
 
 import filelock
 
-TOMATO_PATH = os.path.join(MODELS_DIR, "segment_ripeness.pt")
 FLOWER_PATH = os.path.join(MODELS_DIR, "best.pt")
 
 with filelock.FileLock(os.path.join(MODELS_DIR, "download.lock")):
-    if not os.path.exists(TOMATO_PATH):
-        print("Downloading tomato segmentation model ...")
-        hf_hub_download(repo_id="deenp03/tomato-ripeness-classifier", filename="segment_ripeness.pt", local_dir=MODELS_DIR)
     if not os.path.exists(FLOWER_PATH):
         print("Downloading flower model ...")
         hf_hub_download(
             repo_id="deenp03/tomato_pollination_stage_classifier",
             filename="best.pt", local_dir=MODELS_DIR,
         )
+# SAM3 weights stream from facebook/sam3 the first time the model is built.
 
 print(f"Weights ready. Mode: {'ZeroGPU (pool=1)' if ZEROGPU_MODE else f'Dedicated GPU (pool={MODEL_POOL_SIZE})'}")
 
@@ -113,69 +114,40 @@ print(f"Weights ready. Mode: {'ZeroGPU (pool=1)' if ZEROGPU_MODE else f'Dedicate
 #   Pool of N model pairs pre-loaded at startup. A threading.Semaphore gates
 #   access so at most N requests run concurrently. No @spaces.GPU needed.
 # ---------------------------------------------------------------------------
-def _make_model_pair():
-    sam3 = SAM3SemanticPredictor(overrides=dict(
-        conf=0.30, task="segment", mode="predict",
-        model=TOMATO_PATH, half=True, verbose=False,
-    ))
+def _make_model_triple():
+    """Build (sam3_model, sam3_processor, flower_yolo) on whatever device is available."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Loading {SAM3_REPO} onto {device} ...")
+    sam3_model = Sam3Model.from_pretrained(SAM3_REPO).to(device)
+    sam3_model.eval()
+    sam3_processor = Sam3Processor.from_pretrained(SAM3_REPO)
     flower = YOLO(FLOWER_PATH)
-    return sam3, flower
+    return sam3_model, sam3_processor, flower
 
 
 if ZEROGPU_MODE:
     import spaces
 
     # Lazy singletons — created inside the @spaces.GPU context
-    _sam3_singleton   = None
-    _flower_singleton = None
+    _sam3_model_singleton     = None
+    _sam3_processor_singleton = None
+    _flower_singleton         = None
 
     def _get_zerogpu_models():
-        global _sam3_singleton, _flower_singleton
-        if _sam3_singleton is None:
-            print("Loading SAM3 into GPU memory ...")
-            _sam3_singleton, _flower_singleton = _make_model_pair()
-        return _sam3_singleton, _flower_singleton
+        global _sam3_model_singleton, _sam3_processor_singleton, _flower_singleton
+        if _sam3_model_singleton is None:
+            (_sam3_model_singleton,
+             _sam3_processor_singleton,
+             _flower_singleton) = _make_model_triple()
+        return _sam3_model_singleton, _sam3_processor_singleton, _flower_singleton
 
 else:
     # Pre-load pool at startup (dedicated GPU has memory available immediately)
     print(f"Loading {MODEL_POOL_SIZE} model instance(s) into GPU memory ...")
     _pool: queue.Queue = queue.Queue()
     for _ in range(MODEL_POOL_SIZE):
-        _pool.put(_make_model_pair())
+        _pool.put(_make_model_triple())
     print("Model pool ready.")
-
-
-# ---------------------------------------------------------------------------
-# HSV ripeness classifier — called on each SAM3-detected tomato crop
-# ---------------------------------------------------------------------------
-def classify_ripeness_by_color(region_rgb: np.ndarray) -> str:
-    """
-    Classify a tomato crop as Unripe / Half_Ripe / Ripe by HSV hue distribution.
-
-    HSV hue (OpenCV 0-179):
-      Red/Ripe   : H in [0,10] or [170,180]
-      Orange/Half: H in [10,25]
-      Green/Unripe: H in [35,85]
-    Only saturated+bright pixels (tomato skin) are counted.
-    """
-    hsv = cv2.cvtColor(region_rgb, cv2.COLOR_RGB2HSV)
-    h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-
-    mask     = (s > 60) & (v > 60)
-    h_masked = h[mask]
-
-    if len(h_masked) < 50:
-        return "Unripe"
-
-    total      = len(h_masked)
-    red_pct    = np.sum((h_masked <= 10) | (h_masked >= 170)) / total
-    orange_pct = np.sum((h_masked > 10)  & (h_masked <= 25))  / total
-
-    if red_pct >= 0.35:
-        return "Ripe"
-    if orange_pct >= 0.25 or (red_pct >= 0.20 and orange_pct >= 0.15):
-        return "Half_Ripe"
-    return "Unripe"
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +175,60 @@ def _dedupe_boxes(items: list[dict], iou_thresh: float = 0.5) -> list[dict]:
         if all(_iou(it["bbox"], k["bbox"]) < iou_thresh for k in kept):
             kept.append(it)
     return kept
+
+
+# ---------------------------------------------------------------------------
+# Binary mask → largest external contour as [[x,y], ...]
+# ---------------------------------------------------------------------------
+def _mask_to_polygon(mask: np.ndarray) -> list[list[float]]:
+    contours, _ = cv2.findContours(
+        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        return []
+    largest = max(contours, key=cv2.contourArea)
+    pts = largest.squeeze(1) if largest.ndim == 3 else largest
+    return pts.astype(float).tolist()
+
+
+# ---------------------------------------------------------------------------
+# SAM3 multi-prompt tomato detection (facebook/sam3 via transformers)
+# ---------------------------------------------------------------------------
+def _sam3_detect_tomatoes(sam3_model, sam3_processor,
+                          pil_img: Image.Image,
+                          conf_thresh: float) -> list[dict]:
+    """Run SAM3 once per (prompt, label) pair, dedupe overlapping fruits.
+
+    Returns list of dicts: {label, confidence, bbox: (x1,y1,x2,y2), mask: np.uint8}.
+    """
+    device = next(sam3_model.parameters()).device
+    raw: list[dict] = []
+
+    for prompt, label in TOMATO_PROMPTS:
+        inputs = sam3_processor(
+            images=pil_img, text=prompt, return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad():
+            outputs = sam3_model(**inputs)
+
+        results = sam3_processor.post_process_instance_segmentation(
+            outputs,
+            threshold=conf_thresh,
+            mask_threshold=0.5,
+            target_sizes=inputs.get("original_sizes").tolist(),
+        )[0]
+
+        for mask, box, score in zip(results["masks"], results["boxes"], results["scores"]):
+            x1, y1, x2, y2 = (float(v) for v in box.tolist())
+            raw.append({
+                "label":      label,
+                "confidence": float(score),
+                "bbox":       (x1, y1, x2, y2),
+                "mask":       mask.detach().cpu().numpy().astype(np.uint8),
+            })
+
+    return _dedupe_boxes(raw, iou_thresh=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -365,46 +391,27 @@ def _pil_to_b64(img: Image.Image) -> str:
 # Core inference logic (hardware-agnostic)
 # mode: "tomatoes" | "flowers" | "both"
 # ---------------------------------------------------------------------------
-def _infer(sam3, flower, img_np: np.ndarray,
+def _infer(sam3_model, sam3_processor, flower, img_np: np.ndarray,
            tomato_conf: float, flower_conf: float,
            mode: str = "both") -> dict:
     pil_img    = Image.fromarray(img_np)
     draw_boxes = []
     result     = {}
 
-    # --- SAM3: Tomato detection + HSV ripeness classification ---
+    # --- SAM3 (facebook/sam3): per-ripeness text-prompted detection ---
     if mode in ("tomatoes", "both"):
         tomato_detections = []
         tomato_by_class   = {"Ripe": 0, "Half_Ripe": 0, "Unripe": 0}
 
-        # Collect raw boxes from every SAM3 text prompt; multiple prompts often
-        # detect the same fruit, so we dedupe by IoU before HSV-classifying.
-        raw: list[dict] = []
-        sam3.set_image(img_np)
-        for r in sam3(text=SAM3_PROMPTS):
-            if r.boxes is None or len(r.boxes) == 0:
-                continue
-            for box in r.boxes:
-                conf = float(box.conf[0])
-                if conf < tomato_conf:
-                    continue
-                x1, y1, x2, y2 = (round(float(v), 2) for v in box.xyxy[0])
-                raw.append({"bbox": (x1, y1, x2, y2), "confidence": conf})
-
-        for d in _dedupe_boxes(raw, iou_thresh=0.5):
-            x1, y1, x2, y2 = d["bbox"]
-            conf = d["confidence"]
-
-            # Crop detected region and classify by HSV color
-            ix1, iy1 = max(0, int(x1)), max(0, int(y1))
-            ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
-            crop  = img_np[iy1:iy2, ix1:ix2]
-            label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
-
+        for d in _sam3_detect_tomatoes(sam3_model, sam3_processor, pil_img, tomato_conf):
+            x1, y1, x2, y2 = (round(v, 2) for v in d["bbox"])
+            label  = d["label"]
+            conf   = round(d["confidence"], 4)
             cls_id = TOMATO_LABEL_TO_ID[label]
+
             tomato_detections.append({
                 "class_id": cls_id, "label": label,
-                "confidence": round(conf, 4),
+                "confidence": conf,
                 "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
             })
             tomato_by_class[label] = tomato_by_class.get(label, 0) + 1
@@ -449,48 +456,27 @@ def _infer(sam3, flower, img_np: np.ndarray,
     return result
 
 
-def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
+def _infer_segment(sam3_model, sam3_processor,
+                   img_np: np.ndarray, tomato_conf: float) -> dict:
     """SAM3 segmentation — returns precise polygon contours instead of bounding boxes."""
     pil_img    = Image.fromarray(img_np)
     masks_draw = []
     detections = []
 
-    # Collect raw box+polygon pairs from every SAM3 prompt, then dedupe.
-    raw: list[dict] = []
-    sam3.set_image(img_np)
-    for r in sam3(text=SAM3_PROMPTS):
-        if r.boxes is None or len(r.boxes) == 0:
+    for d in _sam3_detect_tomatoes(sam3_model, sam3_processor, pil_img, tomato_conf):
+        polygon = _mask_to_polygon(d["mask"])
+        if not polygon:
             continue
 
-        # masks.xy is a list of (N,2) numpy arrays — one polygon per detection
-        polygons = r.masks.xy if r.masks is not None else [None] * len(r.boxes)
-
-        for i, box in enumerate(r.boxes):
-            conf = float(box.conf[0])
-            if conf < tomato_conf:
-                continue
-            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
-            polygon = polygons[i].tolist() if polygons[i] is not None else []
-            raw.append({"bbox": (x1, y1, x2, y2), "confidence": conf, "polygon": polygon})
-
-    for d in _dedupe_boxes(raw, iou_thresh=0.5):
-        x1, y1, x2, y2 = d["bbox"]
-        conf    = d["confidence"]
-        polygon = d["polygon"]
-
-        # Crop detected region and classify by HSV color
-        ix1, iy1 = max(0, int(x1)), max(0, int(y1))
-        ix2, iy2 = min(img_np.shape[1], int(x2)), min(img_np.shape[0], int(y2))
-        crop  = img_np[iy1:iy2, ix1:ix2]
-        label = classify_ripeness_by_color(crop) if crop.size > 0 else "Unripe"
-
+        label  = d["label"]
         cls_id = TOMATO_LABEL_TO_ID[label]
         color  = TOMATO_COLORS.get(label, (200, 200, 200))
+        conf   = round(d["confidence"], 4)
 
         detections.append({
             "class_id":   cls_id,
             "label":      label,
-            "confidence": round(conf, 4),
+            "confidence": conf,
             "polygon":    polygon,
         })
         masks_draw.append({"polygon": polygon, "color": color,
@@ -507,32 +493,38 @@ def _infer_segment(sam3, img_np: np.ndarray, tomato_conf: float) -> dict:
 # Public inference entry point — switches on mode
 # ---------------------------------------------------------------------------
 if ZEROGPU_MODE:
-    @spaces.GPU(duration=30)
+    # SAM3 now runs once per ripeness prompt (3 forward passes), so the
+    # per-call duration is bumped from 30s → 60s.
+    @spaces.GPU(duration=60)
     def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float,
                        mode: str = "both") -> dict:
-        sam3, flower = _get_zerogpu_models()
-        return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
+        sam3_model, sam3_processor, flower = _get_zerogpu_models()
+        return _infer(sam3_model, sam3_processor, flower, img_np,
+                      tomato_conf, flower_conf, mode)
 
-    @spaces.GPU(duration=30)
+    @spaces.GPU(duration=60)
     def _run_segment(img_np: np.ndarray, tomato_conf: float) -> dict:
-        sam3, _ = _get_zerogpu_models()
-        return _infer_segment(sam3, img_np, tomato_conf)
+        sam3_model, sam3_processor, _ = _get_zerogpu_models()
+        return _infer_segment(sam3_model, sam3_processor, img_np, tomato_conf)
 
 else:
     def _run_inference(img_np: np.ndarray, tomato_conf: float, flower_conf: float,
                        mode: str = "both") -> dict:
-        sam3, flower = _pool.get()
+        triple = _pool.get()
         try:
-            return _infer(sam3, flower, img_np, tomato_conf, flower_conf, mode)
+            sam3_model, sam3_processor, flower = triple
+            return _infer(sam3_model, sam3_processor, flower, img_np,
+                          tomato_conf, flower_conf, mode)
         finally:
-            _pool.put((sam3, flower))
+            _pool.put(triple)
 
     def _run_segment(img_np: np.ndarray, tomato_conf: float) -> dict:
-        sam3, flower = _pool.get()
+        triple = _pool.get()
         try:
-            return _infer_segment(sam3, img_np, tomato_conf)
+            sam3_model, sam3_processor, _ = triple
+            return _infer_segment(sam3_model, sam3_processor, img_np, tomato_conf)
         finally:
-            _pool.put((sam3, flower))
+            _pool.put(triple)
 
 
 # ---------------------------------------------------------------------------
